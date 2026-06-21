@@ -147,6 +147,8 @@ def _format_terminal(
     risk_severity: str,
     risk_recommendation: str,
     has_executable_scripts: bool,
+    use_llm: bool = True,
+    llm_call_log: list[dict[str, object]] | None = None,
 ) -> str:
     """Generate Rich terminal output and export as string."""
     console = Console(record=True, force_terminal=True, width=80, file=StringIO())
@@ -199,6 +201,17 @@ def _format_terminal(
         comp_table.add_row(f"... and {len(component_metadata) - 15} more", "", "", "")
     console.print(comp_table)
 
+    degraded_notice = _llm_degradation_notice(use_llm, llm_call_log or [])
+    if degraded_notice:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold]Degraded scan[/bold]\n{degraded_notice}",
+                title="[bold red]WARNING[/bold red]",
+                border_style="red",
+            )
+        )
+
     if findings:
         console.print("\n")
         console.print(f"[bold]Issues ({len(findings)})[/bold]\n")
@@ -224,16 +237,64 @@ def _format_terminal(
     return console.export_text()
 
 
-def _build_metadata(has_executable_scripts: bool, use_llm: bool) -> dict[str, object]:
+def _llm_runtime_status(
+    use_llm: bool, llm_call_log: list[dict[str, object]]
+) -> tuple[int, int, bool]:
+    """Return ``(attempted, succeeded, degraded)`` from the LLM call log.
+
+    ``degraded`` is True when the LLM stage was requested and at least one call
+    was attempted, but every call failed at runtime — meaning the report
+    reflects static analysis only despite a deep scan being requested.
+    """
+    attempted = len(llm_call_log)
+    succeeded = sum(1 for r in llm_call_log if r.get("ok"))
+    degraded = bool(use_llm and attempted > 0 and succeeded == 0)
+    return attempted, succeeded, degraded
+
+
+def _llm_degradation_notice(use_llm: bool, llm_call_log: list[dict[str, object]]) -> str | None:
+    """Return a human-readable degraded-scan warning, or None if not degraded."""
+    attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    if not degraded:
+        return None
+    return (
+        f"LLM analysis was requested but all {attempted} LLM call(s) failed - "
+        "results reflect STATIC analysis only."
+    )
+
+
+def _build_metadata(
+    has_executable_scripts: bool,
+    use_llm: bool,
+    llm_call_log: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     """Build the metadata section shared by all output formats."""
+    llm_call_log = llm_call_log or []
     llm_available, llm_error = is_llm_available()
+    attempted, succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+
     meta: dict[str, object] = {
         "has_executable_scripts": has_executable_scripts,
         "skillspector_version": skillspector_version,
         "llm_requested": use_llm,
-        "llm_available": llm_available,
+        # llm_available reflects runtime truth: the binary/credentials were
+        # available AND the stage was not fully degraded (every call failing).
+        "llm_available": llm_available and not degraded,
     }
-    if use_llm and not llm_available:
+    if use_llm and attempted:
+        meta["llm_calls_attempted"] = attempted
+        meta["llm_calls_succeeded"] = succeeded
+    if degraded:
+        meta["llm_degraded"] = True
+        reasons = sorted(
+            {str(r.get("error")) for r in llm_call_log if not r.get("ok") and r.get("error")}
+        )
+        detail = f" Reasons: {'; '.join(reasons)}" if reasons else ""
+        meta["llm_error"] = (
+            f"LLM analysis was requested but all {attempted} LLM call(s) failed; "
+            f"results reflect static analysis only.{detail}"
+        )
+    elif use_llm and not llm_available:
         meta["llm_error"] = llm_error
     return meta
 
@@ -248,6 +309,7 @@ def _format_json(
     risk_recommendation: str,
     has_executable_scripts: bool,
     use_llm: bool = True,
+    llm_call_log: list[dict[str, object]] | None = None,
 ) -> str:
     """Generate JSON report string."""
     skill_name = (manifest.get("name") or "unknown") if manifest else "unknown"
@@ -273,7 +335,7 @@ def _format_json(
             for c in component_metadata
         ],
         "issues": [f.to_dict() for f in findings],
-        "metadata": _build_metadata(has_executable_scripts, use_llm),
+        "metadata": _build_metadata(has_executable_scripts, use_llm, llm_call_log),
     }
     return json.dumps(data, indent=2)
 
@@ -287,6 +349,8 @@ def _format_markdown(
     risk_severity: str,
     risk_recommendation: str,
     has_executable_scripts: bool,
+    use_llm: bool = True,
+    llm_call_log: list[dict[str, object]] | None = None,
 ) -> str:
     """Generate Markdown report string."""
     lines: list[str] = []
@@ -298,6 +362,11 @@ def _format_markdown(
     lines.append(f"**Source:** `{source}`  ")
     lines.append(f"**Scanned:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}  ")
     lines.append("")
+
+    degraded_notice = _llm_degradation_notice(use_llm, llm_call_log or [])
+    if degraded_notice:
+        lines.append(f"> ⚠️ **Degraded scan:** {degraded_notice}")
+        lines.append("")
 
     lines.append("## Risk Assessment\n")
     lines.append("| Metric | Value |")
@@ -359,6 +428,20 @@ def report(state: SkillspectorState) -> dict[str, object]:
     skill_path = state.get("skill_path")
     output_format = state.get("output_format") or "sarif"
     use_llm = state.get("use_llm", True)
+    llm_call_log = state.get("llm_call_log") or []
+
+    # Surface a silent degradation: deep scan requested but every LLM call failed
+    # at runtime, so the report reflects static analysis only. Logged here (once,
+    # operationally) regardless of output format; also embedded in each format's
+    # body / metadata below.
+    _attempted, _succeeded, degraded = _llm_runtime_status(use_llm, llm_call_log)
+    if degraded:
+        logger.warning(
+            "LLM stage degraded: %d/%d LLM call(s) failed; report reflects static "
+            "analysis only (llm_available reported false)",
+            _attempted - _succeeded,
+            _attempted,
+        )
 
     risk_score, risk_severity, risk_recommendation = _compute_risk_score(
         findings, has_executable_scripts
@@ -375,6 +458,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_severity,
             risk_recommendation,
             has_executable_scripts,
+            use_llm=use_llm,
+            llm_call_log=llm_call_log,
         )
     elif output_format == "json":
         report_body = _format_json(
@@ -387,6 +472,7 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_recommendation,
             has_executable_scripts,
             use_llm=use_llm,
+            llm_call_log=llm_call_log,
         )
     elif output_format == "markdown":
         report_body = _format_markdown(
@@ -398,6 +484,8 @@ def report(state: SkillspectorState) -> dict[str, object]:
             risk_severity,
             risk_recommendation,
             has_executable_scripts,
+            use_llm=use_llm,
+            llm_call_log=llm_call_log,
         )
     else:
         report_body = json.dumps(sarif_report, indent=2)

@@ -39,7 +39,7 @@ from skillspector.nodes.analyzers.pattern_defaults import (
     get_explanation,
     get_remediation,
 )
-from skillspector.state import MetaAnalyzerResponse, SkillspectorState
+from skillspector.state import MetaAnalyzerResponse, SkillspectorState, llm_call_record
 
 logger = get_logger(__name__)
 
@@ -399,9 +399,15 @@ def meta_analyzer(state: SkillspectorState) -> MetaAnalyzerResponse:
             len(findings),
             len(filtered),
         )
-        return {"filtered_findings": filtered}
+        return {
+            "filtered_findings": filtered,
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=True)],
+        }
     except ValueError:
         raise
     except Exception as e:
         logger.warning("LLM call failed, using fallback: %s", e)
-        return {"filtered_findings": _fallback_filtered(findings)}
+        return {
+            "filtered_findings": _fallback_filtered(findings),
+            "llm_call_log": [llm_call_record("meta_analyzer", ok=False, error=str(e))],
+        }
